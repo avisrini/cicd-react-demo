@@ -1,0 +1,92 @@
+name: Continuous Deployment
+
+on:
+  push:
+    branches:
+      - master
+      - staging
+
+# Least privilege: this workflow only needs to read the repo. AWS access comes
+# from environment-scoped secrets on each job, never from GITHUB_TOKEN.
+permissions:
+  contents: read
+
+# Never let two deploys to the same ref race each other onto one bucket.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy-staging:
+    name: Deploy staging
+    if: github.ref == 'refs/heads/staging'
+    runs-on: ubuntu-latest
+    # Scopes this job to the staging environment's own secrets, so a staging
+    # credential can never reach the production bucket.
+    environment: staging
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: yarn
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+      - name: Build
+        run: yarn build
+      - name: Verify build output
+        # --delete below mirrors the source dir onto the bucket. If the build
+        # silently produced nothing, that would empty the bucket instead of
+        # deploying. Fail closed rather than sync an empty directory.
+        run: |
+          if [ ! -d dist ] || [ -z "$(ls -A dist)" ]; then
+            echo "::error::dist/ is missing or empty - refusing to sync with --delete"
+            exit 1
+          fi
+      - name: Sync to S3
+        uses: jakejarvis/s3-sync-action@be0c4ab89158cac4278689ebedd8407dd5f35a83 # v0.5.1
+        with:
+          # Drop --acl public-read if the bucket uses Bucket owner enforced
+          # (the S3 default since April 2023); serve via a bucket policy or
+          # CloudFront OAC instead, as the flag errors when ACLs are disabled.
+          args: --acl public-read --follow-symlinks --delete
+        env:
+          AWS_REGION: us-east-1
+          SOURCE_DIR: dist/
+          AWS_S3_BUCKET: ${{ secrets.STAGING_AWS_S3_BUCKET }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.STAGING_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.STAGING_AWS_SECRET_ACCESS_KEY }}
+
+  deploy-production:
+    name: Deploy production
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    # Add required reviewers to this environment in repo settings to gate
+    # production behind an approval.
+    environment: production
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: yarn
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+      - name: Build
+        run: yarn build
+      - name: Verify build output
+        run: |
+          if [ ! -d dist ] || [ -z "$(ls -A dist)" ]; then
+            echo "::error::dist/ is missing or empty - refusing to sync with --delete"
+            exit 1
+          fi
+      - name: Sync to S3
+        uses: jakejarvis/s3-sync-action@be0c4ab89158cac4278689ebedd8407dd5f35a83 # v0.5.1
+        with:
+          args: --acl public-read --follow-symlinks --delete
+        env:
+          AWS_REGION: us-east-1
+          SOURCE_DIR: dist/
+          AWS_S3_BUCKET: ${{ secrets.PRODUCTION_AWS_S3_BUCKET }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.PRODUCTION_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.PRODUCTION_AWS_SECRET_ACCESS_KEY }}
